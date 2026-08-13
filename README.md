@@ -106,7 +106,7 @@ SCORER_REGISTRY: dict[str, Callable[[Case, str], ScoreResult]] = {
 JSONL, one line per case per run. `run_id` (UTC timestamp, e.g. `2026-08-10T15-30-00Z`) and `commit_sha` are embedded in every record, but the *filename* is just whatever `evalrun run --out` points at — the CLI doesn't derive it from `run_id`. In practice that's `results/run.jsonl` for a PR run and `results/baseline.jsonl` for the committed baseline.
 
 ```json
-{"run_id": "2026-08-10T15-30-00Z", "commit_sha": "a1b2c3d", "case_id": "math_basic_01", "model": "meta-llama/Llama-3.1-8B-Instruct", "output": "408", "scorer": "exact_match", "passed": true, "score": 1.0, "latency_ms": 812, "timestamp": "2026-08-10T15:30:04Z", "error": null}
+{"run_id": "2026-08-10T15-30-00Z", "commit_sha": "a1b2c3d", "case_id": "math_basic_01", "model": "llama3.1", "output": "408", "scorer": "exact_match", "passed": true, "score": 1.0, "latency_ms": 812, "timestamp": "2026-08-10T15:30:04Z", "error": null}
 ```
 
 `error` is `null` for a normal scored case; it's populated instead (with `output` usually `null`, `passed: false`, `score: 0.0`) when either the runner call itself failed, or scoring failed after a successful runner call (see "Per-case failure handling" below) — either way the case still gets a record instead of the whole run aborting.
@@ -116,7 +116,7 @@ JSONL, one line per case per run. `run_id` (UTC timestamp, e.g. `2026-08-10T15-3
 ## CLI (`evalrun`)
 
 ```
-evalrun run --dataset datasets/core_regression.yaml --model meta-llama/Llama-3.1-8B-Instruct --out results/run.jsonl [--max-error-rate 0.5]
+evalrun run --dataset datasets/core_regression.yaml --model llama3.1 --out results/run.jsonl [--max-error-rate 0.5]
 evalrun compare --current results/run.jsonl --baseline results/baseline.jsonl [--pass-rate-tolerance 0.02]
 evalrun report --results results/run.jsonl --format markdown
 ```
@@ -129,24 +129,32 @@ evalrun report --results results/run.jsonl --format markdown
 
 `evalrun run` never lets one bad case take down the whole run — every case still gets a `ResultRecord` written, even on failure:
 
-- If the runner call itself fails (network error, rate limit, etc.), that's `RawResult.error`, scoring is skipped, and the record is written with `passed: false`, `score: 0.0`, `output: null`.
-- If the runner call succeeds but scoring then throws (e.g. the judge model returns unparseable JSON, or the judge call itself fails — including hitting an HF Inference billing/rate limit), that exception is caught per-case and recorded as `error: "scoring failed: ..."`, with `output` still populated from the runner so you can see what the model actually said.
+- If the runner call itself fails (Ollama daemon not running, model not pulled, connection error, etc.), that's `RawResult.error`, scoring is skipped, and the record is written with `passed: false`, `score: 0.0`, `output: null`.
+- If the runner call succeeds but scoring then throws (e.g. the judge model returns unparseable JSON, or the judge call itself fails), that exception is caught per-case and recorded as `error: "scoring failed: ..."`, with `output` still populated from the runner so you can see what the model actually said.
 
-This means a single flaky case degrades one row of the results file instead of losing every already-completed (and already-paid-for) API call in the run.
+This means a single flaky case degrades one row of the results file instead of losing every already-completed call in the run.
 
-That leniency has a failure mode of its own: if something systemic breaks (bad/missing `HF_TOKEN`, HF Inference outage), *every* case errors, but the run would otherwise still exit `0` and write a fully-broken results file — which the `update-baseline` job would then happily commit as `results/baseline.jsonl`, silently zeroing out regression detection for everyone (this actually happened once — the committed baseline was 0/18 passed, 18/18 errored, from a missing `HF_TOKEN` secret). `--max-error-rate` (default `0.5`) guards against this: `evalrun run` still writes the results file for debugging, but exits non-zero — and the CI job step fails — if more than that fraction of cases errored.
+That leniency has a failure mode of its own: if something systemic breaks, *every* case errors, but the run would otherwise still exit `0` and write a fully-broken results file — which the `update-baseline` job would then happily commit as `results/baseline.jsonl`, silently zeroing out regression detection for everyone. This actually happened twice while wiring up CI, under the (now-replaced) hosted-API backend: once from a missing repo secret (100% of cases errored with an auth failure) and once from that provider's account hitting a billing/credit limit mid-run (61% errored) — `--max-error-rate` (default `0.5`) caught both and refused to let either become the baseline. The runner is local-only via Ollama now, so neither of those two specific failure modes applies anymore, but the guardrail stays as protection against whatever the next systemic failure turns out to be (Ollama daemon down, model not pulled in CI, etc.).
 
 ## GitHub Actions (`.github/workflows/eval.yml`)
 
-- **PR workflow** (`eval-pr` job): triggers on `pull_request` for paths `evalrun/**`, `datasets/**`. Steps: checkout → install → `evalrun run` → `evalrun report --format markdown` (captured to a file) → `evalrun compare` against committed `results/baseline.jsonl` (its exit code is captured, not failed on immediately) → post/update a single PR comment (matched by an HTML marker, so repeated pushes update one comment instead of spamming) containing both the report table and the compare output → **fail the job** last, based on the captured compare exit code, so the comment always posts even when the job is about to fail. Note: making this job a **required status check** (so regressions block merge) is a repo Settings → Branches step, not something the workflow YAML itself configures.
-- **Main workflow** (`update-baseline` job): on `push` to `main` for the same paths, runs `evalrun run` straight into `results/baseline.jsonl` and commits it — a no-op (no commit/push) if the output is identical to what's already committed.
-- Secret: `HF_TOKEN` as a repo secret.
+- **Triggers**: `pull_request` and `push` to `main`, both filtered to paths `evalrun/**`, `datasets/**`, `pyproject.toml`, and `.github/workflows/eval.yml` itself — so a change to the workflow file gets a real run to validate it, not just a silent no-op. (Path filters are a common trap: a commit that only touches the workflow file won't trigger anything unless the workflow file is in its own filter list — this bit us once already.)
+- **No secrets required.** Since the runner moved to local Ollama, there's no API key to configure at all — a meaningful simplification over the hosted-API version of this workflow.
+- Both jobs install Ollama fresh on the GH-hosted runner, start the daemon, and pull `llama3.1` before running anything:
+  ```
+  curl -fsSL https://ollama.com/install.sh | sh
+  ollama serve &            # + poll localhost:11434 until it's up
+  ollama pull llama3.1
+  ```
+  There's no model-weight caching across runs yet (each run re-downloads ~5GB), and GH-hosted runners are CPU-only with no GPU, so a full 18-case eval — especially the `llm_judge` cases — is meaningfully slower here than running the same dataset locally. This was a known, accepted tradeoff when choosing Ollama over a hosted API for CI: no billing/secrets to manage, at the cost of CI wall-clock time. Caching `~/.ollama` (or wherever the installed daemon actually stores models — worth confirming from a real run's logs) is the obvious next optimization if this becomes painful.
+- **PR workflow** (`eval-pr` job): checkout → install deps → install/start Ollama, pull model → `evalrun run` → `evalrun report --format markdown` (captured to a file) → `evalrun compare` against committed `results/baseline.jsonl` (its exit code is captured, not failed on immediately) → post/update a single PR comment (matched by an HTML marker, so repeated pushes update one comment instead of spamming) containing both the report table and the compare output → **fail the job** last, based on the captured compare exit code, so the comment always posts even when the job is about to fail. Note: making this job a **required status check** (so regressions block merge) is a repo Settings → Branches step, not something the workflow YAML itself configures.
+- **Main workflow** (`update-baseline` job): same Ollama setup, then runs `evalrun run` straight into `results/baseline.jsonl` and commits it — a no-op (no commit/push) if the output is identical to what's already committed.
 
 ## Implementation Order
 
 1. `evalrun/dataset.py` (schema + loader/validator) + seed `datasets/core_regression.yaml`
 2. `evalrun/scorers.py` — `exact_match`, `regex` first (no API dependency, unblocks testing)
-3. `evalrun/runner.py` (Hugging Face Inference wrapper)
+3. `evalrun/runner.py` (Ollama wrapper)
 4. Add `llm_judge_scorer` once the runner works
 5. `evalrun/results.py` (JSONL write/read, run-id/commit keying)
 6. `evalrun/cli.py` wiring `run` / `report`
