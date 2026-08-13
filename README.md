@@ -24,7 +24,7 @@ evaluation/
 │   ├── cli.py                      # `evalrun` entrypoint
 │   └── compare.py                  # baseline vs. current diff logic
 ├── datasets/
-│   └── core_regression.yaml        # seed dataset (15-20 cases)
+│   └── core_regression.yaml        # seed dataset (18 cases)
 ├── results/
 │   └── baseline.jsonl              # committed; updated on merge to main
 └── .github/
@@ -60,13 +60,13 @@ evaluation/
 
 Fields: `id`, `input`, `expected_output` (omitted for judge-scored cases, used as reference for exact/regex), `scorer` (string shorthand or object), `tags` (free metadata now; later used to filter into suites like `tool-use`/`rag`/`safety`).
 
-Seed dataset categories (15-20 cases total): arithmetic/exact-match (2), regex extraction — email/date/phone (3), format compliance — JSON validity/list formatting (2), instruction following — word-count limits/tone/refusal (3), summarization quality via LLM-judge (3), reasoning/QA via LLM-judge (3), edge cases — empty input, basic prompt-injection attempt (2).
+Seed dataset categories (18 cases total): arithmetic/exact-match (2), regex extraction — email/date/phone (3), format compliance — JSON validity/list formatting (2), instruction following — word-count limits/tone/refusal (3), summarization quality via LLM-judge (3), reasoning/QA via LLM-judge (3), edge cases — empty input, basic prompt-injection attempt (2).
 
 ## Runner (`evalrun/runner.py`)
 
 - `run(dataset, model="meta-llama/Llama-3.1-8B-Instruct", concurrency=5) -> list[RawResult]`.
 - One `chat_completion()` call per case via `huggingface_hub.InferenceClient()`; no tools/thinking (keep deterministic).
-- Retries: rely on the client's built-in retry behavior, no hand-rolled backoff.
+- No retries: `huggingface_hub.InferenceClient` makes a single request per call with no built-in retry/backoff. A failed call (timeout, rate limit, provider error) is captured as `RawResult.error` rather than retried or raised — a hand-rolled retry loop is a known gap, not yet built.
 - Local disk cache in `.eval_cache/` keyed by `hash(model + input + params)`, skipped in CI unless explicitly enabled — avoids re-billing unchanged cases during local iteration.
 - Concurrency via `ThreadPoolExecutor` (SDK is sync; no asyncio needed at this scale).
 - Output: `RawResult(case_id, output_text, latency_ms, usage, error)`. Scoring is a separate pass — runner never scores.
@@ -74,10 +74,10 @@ Seed dataset categories (15-20 cases total): arithmetic/exact-match (2), regex e
 ## Scorers (`evalrun/scorers.py`)
 
 ```python
-def score(case: dict, output: str) -> ScoreResult:
+def score(case: Case, output: str) -> ScoreResult:
     """Returns ScoreResult(passed: bool, score: float, detail: str)"""
 
-SCORER_REGISTRY: dict[str, Callable] = {
+SCORER_REGISTRY: dict[str, Callable[[Case, str], ScoreResult]] = {
     "exact_match": exact_match_scorer,
     "regex": regex_scorer,
     "llm_judge": llm_judge_scorer,
@@ -103,11 +103,13 @@ SCORER_REGISTRY: dict[str, Callable] = {
 
 ## Results (`evalrun/results.py`)
 
-JSONL, one line per case per run, written to `results/{run_id}.jsonl`:
+JSONL, one line per case per run. `run_id` (UTC timestamp, e.g. `2026-08-10T15-30-00Z`) and `commit_sha` are embedded in every record, but the *filename* is just whatever `evalrun run --out` points at — the CLI doesn't derive it from `run_id`. In practice that's `results/run.jsonl` for a PR run and `results/baseline.jsonl` for the committed baseline.
 
 ```json
-{"run_id": "2026-08-10T15-30-00Z", "commit_sha": "a1b2c3d", "case_id": "math_basic_01", "model": "meta-llama/Llama-3.1-8B-Instruct", "output": "408", "scorer": "exact_match", "passed": true, "score": 1.0, "latency_ms": 812, "timestamp": "2026-08-10T15:30:04Z"}
+{"run_id": "2026-08-10T15-30-00Z", "commit_sha": "a1b2c3d", "case_id": "math_basic_01", "model": "meta-llama/Llama-3.1-8B-Instruct", "output": "408", "scorer": "exact_match", "passed": true, "score": 1.0, "latency_ms": 812, "timestamp": "2026-08-10T15:30:04Z", "error": null}
 ```
+
+`error` is `null` for a normal scored case; it's populated instead (with `output` usually `null`, `passed: false`, `score: 0.0`) when either the runner call itself failed, or scoring failed after a successful runner call (see "Per-case failure handling" below) — either way the case still gets a record instead of the whole run aborting.
 
 `results/baseline.jsonl` is **committed to the repo** and represents main's latest run. A CI step on merge-to-main overwrites it with the new run's output.
 
@@ -115,14 +117,27 @@ JSONL, one line per case per run, written to `results/{run_id}.jsonl`:
 
 ```
 evalrun run --dataset datasets/core_regression.yaml --model meta-llama/Llama-3.1-8B-Instruct --out results/run.jsonl
-evalrun compare --current results/run.jsonl --baseline results/baseline.jsonl
+evalrun compare --current results/run.jsonl --baseline results/baseline.jsonl [--pass-rate-tolerance 0.02]
 evalrun report --results results/run.jsonl --format markdown
 ```
 
+`evalrun compare` exits `0` if there's no regression, `1` if there is — that's the mechanism the CI job below fails on. `--pass-rate-tolerance` (default `0.02`, i.e. 2 points) sets how much the aggregate pass rate is allowed to drop before that alone counts as a regression; any single case flipping from passed→failed always counts, tolerance or not.
+
+`evalrun compare` also treats a missing `--baseline` file as an empty baseline (every case reported as new, nothing can regress) rather than failing — this bootstraps a fresh repo's first run/PR before `results/baseline.jsonl` exists yet.
+
+### Per-case failure handling
+
+`evalrun run` never lets one bad case take down the whole run — every case still gets a `ResultRecord` written, even on failure:
+
+- If the runner call itself fails (network error, rate limit, etc.), that's `RawResult.error`, scoring is skipped, and the record is written with `passed: false`, `score: 0.0`, `output: null`.
+- If the runner call succeeds but scoring then throws (e.g. the judge model returns unparseable JSON, or the judge call itself fails — including hitting an HF Inference billing/rate limit), that exception is caught per-case and recorded as `error: "scoring failed: ..."`, with `output` still populated from the runner so you can see what the model actually said.
+
+This means a single flaky case degrades one row of the results file instead of losing every already-completed (and already-paid-for) API call in the run.
+
 ## GitHub Actions (`.github/workflows/eval.yml`)
 
-- **PR workflow**: triggers on `pull_request` for paths `evalrun/**`, `datasets/**`. Steps: checkout → install → `evalrun run` → `evalrun compare` against committed `results/baseline.jsonl` → post PR comment via `evalrun report --format markdown` (through `actions/github-script` or a comment action) → **fail the job** (non-zero exit) if any case that passed on baseline now fails, or aggregate pass-rate drops beyond a small tolerance. This should be wired as a required status check so regressions block merge.
-- **Main workflow**: on push to `main`, runs `evalrun run` and overwrites/commits `results/baseline.jsonl`.
+- **PR workflow** (`eval-pr` job): triggers on `pull_request` for paths `evalrun/**`, `datasets/**`. Steps: checkout → install → `evalrun run` → `evalrun report --format markdown` (captured to a file) → `evalrun compare` against committed `results/baseline.jsonl` (its exit code is captured, not failed on immediately) → post/update a single PR comment (matched by an HTML marker, so repeated pushes update one comment instead of spamming) containing both the report table and the compare output → **fail the job** last, based on the captured compare exit code, so the comment always posts even when the job is about to fail. Note: making this job a **required status check** (so regressions block merge) is a repo Settings → Branches step, not something the workflow YAML itself configures.
+- **Main workflow** (`update-baseline` job): on `push` to `main` for the same paths, runs `evalrun run` straight into `results/baseline.jsonl` and commits it — a no-op (no commit/push) if the output is identical to what's already committed.
 - Secret: `HF_TOKEN` as a repo secret.
 
 ## Implementation Order

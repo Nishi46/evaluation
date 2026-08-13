@@ -1,3 +1,6 @@
+from dataclasses import replace
+from pathlib import Path
+
 import click
 
 from evalrun.compare import DEFAULT_PASS_RATE_TOLERANCE, compare, is_regression
@@ -33,7 +36,12 @@ def run_cmd(dataset_path: str, model: str, out_path: str, concurrency: int) -> N
     records = []
     for raw in raw_results:
         case = cases_by_id[raw.case_id]
-        scored = None if raw.error else score(case, raw.output_text)
+        scored = None
+        if not raw.error:
+            try:
+                scored = score(case, raw.output_text)
+            except Exception as exc:
+                raw = replace(raw, error=f"scoring failed: {exc}")
         records.append(build_record(case, raw, scored, run_id, commit_sha, model))
 
     write_results(records, out_path)
@@ -60,7 +68,7 @@ def report_cmd(results_path: str, fmt: str) -> None:
 
 @main.command("compare")
 @click.option("--current", "current_path", required=True, type=click.Path(exists=True), help="Path to current results JSONL.")
-@click.option("--baseline", "baseline_path", required=True, type=click.Path(exists=True), help="Path to baseline results JSONL.")
+@click.option("--baseline", "baseline_path", required=True, type=click.Path(), help="Path to baseline results JSONL.")
 @click.option(
     "--pass-rate-tolerance",
     default=DEFAULT_PASS_RATE_TOLERANCE,
@@ -68,7 +76,11 @@ def report_cmd(results_path: str, fmt: str) -> None:
     help="Allowed aggregate pass-rate drop (as a fraction, e.g. 0.02 = 2 points) before failing.",
 )
 def compare_cmd(current_path: str, baseline_path: str, pass_rate_tolerance: float) -> None:
-    baseline_records = read_results(baseline_path)
+    if Path(baseline_path).exists():
+        baseline_records = read_results(baseline_path)
+    else:
+        click.echo(f"no baseline found at {baseline_path} — treating as empty (first run).")
+        baseline_records = []
     current_records = read_results(current_path)
 
     result = compare(baseline_records, current_records)
