@@ -1,5 +1,6 @@
 import click
 
+from evalrun.compare import DEFAULT_PASS_RATE_TOLERANCE, compare, is_regression
 from evalrun.dataset import load_dataset
 from evalrun.results import ResultRecord, build_record, generate_run_id, get_commit_sha, read_results, write_results
 from evalrun.runner import DEFAULT_MODEL
@@ -55,6 +56,44 @@ def report_cmd(results_path: str, fmt: str) -> None:
         raise click.ClickException(f"no results found in {results_path}")
 
     click.echo(_render_markdown(records))
+
+
+@main.command("compare")
+@click.option("--current", "current_path", required=True, type=click.Path(exists=True), help="Path to current results JSONL.")
+@click.option("--baseline", "baseline_path", required=True, type=click.Path(exists=True), help="Path to baseline results JSONL.")
+@click.option(
+    "--pass-rate-tolerance",
+    default=DEFAULT_PASS_RATE_TOLERANCE,
+    show_default=True,
+    help="Allowed aggregate pass-rate drop (as a fraction, e.g. 0.02 = 2 points) before failing.",
+)
+def compare_cmd(current_path: str, baseline_path: str, pass_rate_tolerance: float) -> None:
+    baseline_records = read_results(baseline_path)
+    current_records = read_results(current_path)
+
+    result = compare(baseline_records, current_records)
+
+    click.echo(f"Baseline: {sum(1 for r in baseline_records if r.passed)}/{result.baseline_count} passed ({result.baseline_pass_rate * 100:.1f}%)")
+    click.echo(f"Current:  {sum(1 for r in current_records if r.passed)}/{result.current_count} passed ({result.current_pass_rate * 100:.1f}%)")
+    change_pts = (result.current_pass_rate - result.baseline_pass_rate) * 100 + 0.0
+    click.echo(f"Pass rate change: {change_pts:+.1f} pts (tolerance: {pass_rate_tolerance * 100:.1f} pts)")
+
+    if result.regressions:
+        click.echo("\nRegressions (passed on baseline, now failing):")
+        for reg in result.regressions:
+            suffix = f" (error: {reg.current_error})" if reg.current_error else ""
+            click.echo(f"  - {reg.case_id}{suffix}")
+
+    if result.new_case_ids:
+        click.echo(f"\nNew cases (not in baseline): {', '.join(result.new_case_ids)}")
+    if result.missing_case_ids:
+        click.echo(f"\nMissing cases (in baseline, not in current): {', '.join(result.missing_case_ids)}")
+
+    if is_regression(result, pass_rate_tolerance):
+        click.echo("\nREGRESSION DETECTED — failing.")
+        raise SystemExit(1)
+
+    click.echo("\nNo regressions detected.")
 
 
 def _render_markdown(records: list[ResultRecord]) -> str:
