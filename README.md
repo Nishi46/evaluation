@@ -8,6 +8,36 @@ A full eval framework has five layers (dataset, runner, scorer, results store, C
 
 Other use cases (tool-trajectory scoring, RAG retrieval scoring, safety datasets, multi-model comparison) are deliberately left as extension points via the scorer registry and the dataset `tags` field, not built now.
 
+## How to Replicate
+
+Prerequisites: Python 3.10+, and [Ollama](https://ollama.com) installed locally.
+
+```bash
+# 1. Start the Ollama daemon and pull the model used by the runner/judge
+ollama serve &
+ollama pull llama3.1
+
+# 2. Clone and install the project (editable install picks up the `evalrun` CLI)
+git clone <this-repo-url>
+cd evaluation
+python3 -m venv .venv && source .venv/bin/activate
+pip install -e .
+
+# 3. (Optional) copy the env template — only needed if Ollama runs somewhere other than localhost
+cp .env.example .env
+
+# 4. Run the seed dataset and write results
+evalrun run --dataset datasets/core_regression.yaml --model llama3.1 --out results/run.jsonl
+
+# 5. Render a markdown report
+evalrun report --results results/run.jsonl --format markdown
+
+# 6. Compare against the committed baseline (exits 1 on regression)
+evalrun compare --current results/run.jsonl --baseline results/baseline.jsonl
+```
+
+No API key or secrets are required — everything runs against the local Ollama daemon on `http://localhost:11434`. To exercise the CI path end to end, open a PR that touches `datasets/core_regression.yaml`, `evalrun/**`, `pyproject.toml`, or the workflow file itself, and the `eval-pr` job in [.github/workflows/eval.yml](.github/workflows/eval.yml) will install Ollama, run the dataset, and post a report/compare comment on the PR (see "Verification" below for a fuller manual check).
+
 ## Directory Structure
 
 ```
