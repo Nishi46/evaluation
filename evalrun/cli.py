@@ -10,6 +10,8 @@ from evalrun.runner import DEFAULT_MODEL
 from evalrun.runner import run as run_dataset
 from evalrun.scorers import score
 
+DEFAULT_MAX_ERROR_RATE = 0.5
+
 
 @click.group()
 def main():
@@ -21,7 +23,13 @@ def main():
 @click.option("--model", default=DEFAULT_MODEL, show_default=True, help="Model to run against.")
 @click.option("--out", "out_path", required=True, type=click.Path(), help="Path to write results JSONL.")
 @click.option("--concurrency", default=5, show_default=True, help="Number of concurrent requests.")
-def run_cmd(dataset_path: str, model: str, out_path: str, concurrency: int) -> None:
+@click.option(
+    "--max-error-rate",
+    default=DEFAULT_MAX_ERROR_RATE,
+    show_default=True,
+    help="Fraction of cases allowed to error (runner or scoring failures) before the command exits non-zero.",
+)
+def run_cmd(dataset_path: str, model: str, out_path: str, concurrency: int, max_error_rate: float) -> None:
     cases = load_dataset(dataset_path)
     if not cases:
         raise click.ClickException(f"no cases found in {dataset_path}")
@@ -53,6 +61,14 @@ def run_cmd(dataset_path: str, model: str, out_path: str, concurrency: int) -> N
         summary += f", {errored} errored"
     click.echo(summary)
     click.echo(f"wrote results to {out_path}")
+
+    error_rate = errored / len(records) if records else 0.0
+    if error_rate > max_error_rate:
+        raise click.ClickException(
+            f"{errored}/{len(records)} cases errored ({error_rate:.0%}), above --max-error-rate "
+            f"({max_error_rate:.0%}). Results were still written to {out_path} for inspection, but this run "
+            f"is refused as unhealthy — e.g. do not commit it as a baseline."
+        )
 
 
 @main.command("report")

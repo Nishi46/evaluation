@@ -116,7 +116,7 @@ JSONL, one line per case per run. `run_id` (UTC timestamp, e.g. `2026-08-10T15-3
 ## CLI (`evalrun`)
 
 ```
-evalrun run --dataset datasets/core_regression.yaml --model meta-llama/Llama-3.1-8B-Instruct --out results/run.jsonl
+evalrun run --dataset datasets/core_regression.yaml --model meta-llama/Llama-3.1-8B-Instruct --out results/run.jsonl [--max-error-rate 0.5]
 evalrun compare --current results/run.jsonl --baseline results/baseline.jsonl [--pass-rate-tolerance 0.02]
 evalrun report --results results/run.jsonl --format markdown
 ```
@@ -133,6 +133,8 @@ evalrun report --results results/run.jsonl --format markdown
 - If the runner call succeeds but scoring then throws (e.g. the judge model returns unparseable JSON, or the judge call itself fails — including hitting an HF Inference billing/rate limit), that exception is caught per-case and recorded as `error: "scoring failed: ..."`, with `output` still populated from the runner so you can see what the model actually said.
 
 This means a single flaky case degrades one row of the results file instead of losing every already-completed (and already-paid-for) API call in the run.
+
+That leniency has a failure mode of its own: if something systemic breaks (bad/missing `HF_TOKEN`, HF Inference outage), *every* case errors, but the run would otherwise still exit `0` and write a fully-broken results file — which the `update-baseline` job would then happily commit as `results/baseline.jsonl`, silently zeroing out regression detection for everyone (this actually happened once — the committed baseline was 0/18 passed, 18/18 errored, from a missing `HF_TOKEN` secret). `--max-error-rate` (default `0.5`) guards against this: `evalrun run` still writes the results file for debugging, but exits non-zero — and the CI job step fails — if more than that fraction of cases errored.
 
 ## GitHub Actions (`.github/workflows/eval.yml`)
 
