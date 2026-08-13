@@ -28,9 +28,21 @@ jobs:
 
       - run: pip install -e .
 
+      - name: Install Ollama
+        run: curl -fsSL https://ollama.com/install.sh | sh
+
+      - name: Start Ollama server
+        run: |
+          ollama serve &
+          for _ in $(seq 1 60); do
+            curl -sf http://localhost:11434 >/dev/null && break
+            sleep 1
+          done
+
+      - name: Pull model
+        run: ollama pull llama3.1
+
       - name: Run eval
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: evalrun run --dataset datasets/core_regression.yaml --out results/run.jsonl
 
       - name: Generate report
@@ -96,9 +108,21 @@ jobs:
 
       - run: pip install -e .
 
+      - name: Install Ollama
+        run: curl -fsSL https://ollama.com/install.sh | sh
+
+      - name: Start Ollama server
+        run: |
+          ollama serve &
+          for _ in $(seq 1 60); do
+            curl -sf http://localhost:11434 >/dev/null && break
+            sleep 1
+          done
+
+      - name: Pull model
+        run: ollama pull llama3.1
+
       - name: Run eval
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: evalrun run --dataset datasets/core_regression.yaml --out results/baseline.jsonl
 
       - name: Commit updated baseline
