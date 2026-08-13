@@ -14,11 +14,11 @@ Other use cases (tool-trajectory scoring, RAG retrieval scoring, safety datasets
 evaluation/
 ├── README.md                       # this file
 ├── pyproject.toml
-├── .env.example                    # ANTHROPIC_API_KEY
+├── .env.example                    # HF_TOKEN
 ├── evalrun/
 │   ├── __init__.py
 │   ├── dataset.py                  # load/validate YAML dataset
-│   ├── runner.py                   # calls Anthropic API against dataset
+│   ├── runner.py                   # calls HF Inference API against dataset
 │   ├── scorers.py                  # scorer registry + exact_match/regex/llm_judge
 │   ├── results.py                  # JSONL read/write, run-id/commit keying
 │   ├── cli.py                      # `evalrun` entrypoint
@@ -64,9 +64,9 @@ Seed dataset categories (15-20 cases total): arithmetic/exact-match (2), regex e
 
 ## Runner (`evalrun/runner.py`)
 
-- `run(dataset, model="claude-sonnet-5", concurrency=5) -> list[RawResult]`.
-- One `messages.create()` call per case via `anthropic.Anthropic()`; no tools/thinking (keep deterministic).
-- Retries: rely on SDK's built-in `max_retries`, no hand-rolled backoff.
+- `run(dataset, model="meta-llama/Llama-3.1-8B-Instruct", concurrency=5) -> list[RawResult]`.
+- One `chat_completion()` call per case via `huggingface_hub.InferenceClient()`; no tools/thinking (keep deterministic).
+- Retries: rely on the client's built-in retry behavior, no hand-rolled backoff.
 - Local disk cache in `.eval_cache/` keyed by `hash(model + input + params)`, skipped in CI unless explicitly enabled — avoids re-billing unchanged cases during local iteration.
 - Concurrency via `ThreadPoolExecutor` (SDK is sync; no asyncio needed at this scale).
 - Output: `RawResult(case_id, output_text, latency_ms, usage, error)`. Scoring is a separate pass — runner never scores.
@@ -86,7 +86,7 @@ SCORER_REGISTRY: dict[str, Callable] = {
 
 - `exact_match_scorer`: normalized (whitespace/case) string compare against `expected_output`.
 - `regex_scorer`: `re.search(pattern, output)`.
-- `llm_judge_scorer`: judge model is **the same model as the runner (claude-sonnet-5)** — keeps the framework to a single model dependency for Phase 1. Uses structured output (`output_config.format` JSON schema: `{score: int, reasoning: str}`) rather than free-text parsing.
+- `llm_judge_scorer`: judge model is **the same model as the runner (`meta-llama/Llama-3.1-8B-Instruct` via Hugging Face Inference)** — keeps the framework to a single model dependency for Phase 1. Uses structured output (`response_format` JSON schema via `chat_completion`: `{score: int, reasoning: str}`), with a fallback that extracts the first JSON object from the response if a given HF Inference provider doesn't strictly enforce the schema.
 - The registry is the extension point for future scorer types (tool-trajectory, retrieval-precision, safety-classifier) — new scorers register a function, no runner changes needed.
 
 ## Results (`evalrun/results.py`)
@@ -94,7 +94,7 @@ SCORER_REGISTRY: dict[str, Callable] = {
 JSONL, one line per case per run, written to `results/{run_id}.jsonl`:
 
 ```json
-{"run_id": "2026-08-10T15-30-00Z", "commit_sha": "a1b2c3d", "case_id": "math_basic_01", "model": "claude-sonnet-5", "output": "408", "scorer": "exact_match", "passed": true, "score": 1.0, "latency_ms": 812, "timestamp": "2026-08-10T15:30:04Z"}
+{"run_id": "2026-08-10T15-30-00Z", "commit_sha": "a1b2c3d", "case_id": "math_basic_01", "model": "meta-llama/Llama-3.1-8B-Instruct", "output": "408", "scorer": "exact_match", "passed": true, "score": 1.0, "latency_ms": 812, "timestamp": "2026-08-10T15:30:04Z"}
 ```
 
 `results/baseline.jsonl` is **committed to the repo** and represents main's latest run. A CI step on merge-to-main overwrites it with the new run's output.
@@ -102,7 +102,7 @@ JSONL, one line per case per run, written to `results/{run_id}.jsonl`:
 ## CLI (`evalrun`)
 
 ```
-evalrun run --dataset datasets/core_regression.yaml --model claude-sonnet-5 --out results/run.jsonl
+evalrun run --dataset datasets/core_regression.yaml --model meta-llama/Llama-3.1-8B-Instruct --out results/run.jsonl
 evalrun compare --current results/run.jsonl --baseline results/baseline.jsonl
 evalrun report --results results/run.jsonl --format markdown
 ```
@@ -111,13 +111,13 @@ evalrun report --results results/run.jsonl --format markdown
 
 - **PR workflow**: triggers on `pull_request` for paths `evalrun/**`, `datasets/**`. Steps: checkout → install → `evalrun run` → `evalrun compare` against committed `results/baseline.jsonl` → post PR comment via `evalrun report --format markdown` (through `actions/github-script` or a comment action) → **fail the job** (non-zero exit) if any case that passed on baseline now fails, or aggregate pass-rate drops beyond a small tolerance. This should be wired as a required status check so regressions block merge.
 - **Main workflow**: on push to `main`, runs `evalrun run` and overwrites/commits `results/baseline.jsonl`.
-- Secret: `ANTHROPIC_API_KEY` as a repo secret.
+- Secret: `HF_TOKEN` as a repo secret.
 
 ## Implementation Order
 
 1. `evalrun/dataset.py` (schema + loader/validator) + seed `datasets/core_regression.yaml`
 2. `evalrun/scorers.py` — `exact_match`, `regex` first (no API dependency, unblocks testing)
-3. `evalrun/runner.py` (Anthropic SDK wrapper)
+3. `evalrun/runner.py` (Hugging Face Inference wrapper)
 4. Add `llm_judge_scorer` once the runner works
 5. `evalrun/results.py` (JSONL write/read, run-id/commit keying)
 6. `evalrun/cli.py` wiring `run` / `report`

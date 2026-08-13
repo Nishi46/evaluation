@@ -1,12 +1,26 @@
+import json
 import re
 from dataclasses import dataclass
 from typing import Callable
 
-import anthropic
+from huggingface_hub import (
+    ChatCompletionInputJSONSchema,
+    ChatCompletionInputResponseFormatJSONSchema,
+    InferenceClient,
+)
 
 from evalrun.dataset import Case
+from evalrun.runner import DEFAULT_MODEL as JUDGE_MODEL
 
-JUDGE_MODEL = "claude-sonnet-5"
+JUDGE_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "score": {"type": "integer"},
+        "reasoning": {"type": "string"},
+    },
+    "required": ["score", "reasoning"],
+    "additionalProperties": False,
+}
 
 
 @dataclass
@@ -37,28 +51,34 @@ def regex_scorer(case: Case, output: str) -> ScoreResult:
     )
 
 
+def _parse_judge_json(text: str) -> dict:
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        # not every HF Inference provider enforces the JSON schema strictly;
+        # fall back to pulling the first JSON object out of a prose response.
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if not match:
+            raise ValueError(f"could not find JSON object in judge output: {text!r}")
+        return json.loads(match.group(0))
+
+
 def llm_judge_scorer(case: Case, output: str) -> ScoreResult:
     rubric = case.scorer_config["rubric"]
     pass_threshold = case.scorer_config.get("pass_threshold", 4)
 
-    client = anthropic.Anthropic()
-    response = client.messages.create(
+    client = InferenceClient()
+    response = client.chat_completion(
         model=JUDGE_MODEL,
         max_tokens=1024,
-        output_config={
-            "format": {
-                "type": "json_schema",
-                "schema": {
-                    "type": "object",
-                    "properties": {
-                        "score": {"type": "integer"},
-                        "reasoning": {"type": "string"},
-                    },
-                    "required": ["score", "reasoning"],
-                    "additionalProperties": False,
-                },
-            }
-        },
+        response_format=ChatCompletionInputResponseFormatJSONSchema(
+            type="json_schema",
+            json_schema=ChatCompletionInputJSONSchema(
+                name="judge_score",
+                schema=JUDGE_JSON_SCHEMA,
+                strict=True,
+            ),
+        ),
         messages=[
             {
                 "role": "user",
@@ -73,10 +93,7 @@ def llm_judge_scorer(case: Case, output: str) -> ScoreResult:
         ],
     )
 
-    text = next(b.text for b in response.content if b.type == "text")
-    import json
-
-    parsed = json.loads(text)
+    parsed = _parse_judge_json(response.choices[0].message.content)
     score = int(parsed["score"])
     reasoning = parsed["reasoning"]
     passed = score >= pass_threshold

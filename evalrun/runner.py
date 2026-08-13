@@ -7,11 +7,11 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-import anthropic
+from huggingface_hub import InferenceClient
 
 from evalrun.dataset import Case
 
-DEFAULT_MODEL = "claude-sonnet-5"
+DEFAULT_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 MAX_TOKENS = 1024
 TEMPERATURE = 0
 CACHE_DIR = Path(".eval_cache")
@@ -51,7 +51,7 @@ def _write_cache(key: str, result: RawResult) -> None:
     (CACHE_DIR / f"{key}.json").write_text(json.dumps(asdict(result)))
 
 
-def _call_case(client: anthropic.Anthropic, case: Case, model: str) -> RawResult:
+def _call_case(client: InferenceClient, case: Case, model: str) -> RawResult:
     params = {"max_tokens": MAX_TOKENS, "temperature": TEMPERATURE}
     key = _cache_key(model, case.input, params)
 
@@ -62,20 +62,19 @@ def _call_case(client: anthropic.Anthropic, case: Case, model: str) -> RawResult
 
     start = time.monotonic()
     try:
-        response = client.messages.create(
+        response = client.chat_completion(
             model=model,
             max_tokens=MAX_TOKENS,
             temperature=TEMPERATURE,
             messages=[{"role": "user", "content": case.input}],
         )
-        output_text = "".join(block.text for block in response.content if block.type == "text")
         result = RawResult(
             case_id=case.id,
-            output_text=output_text,
+            output_text=response.choices[0].message.content,
             latency_ms=(time.monotonic() - start) * 1000,
             usage={
-                "input_tokens": response.usage.input_tokens,
-                "output_tokens": response.usage.output_tokens,
+                "input_tokens": response.usage.prompt_tokens,
+                "output_tokens": response.usage.completion_tokens,
             },
             error=None,
         )
@@ -94,6 +93,6 @@ def _call_case(client: anthropic.Anthropic, case: Case, model: str) -> RawResult
 
 
 def run(dataset: list[Case], model: str = DEFAULT_MODEL, concurrency: int = 5) -> list[RawResult]:
-    client = anthropic.Anthropic()
+    client = InferenceClient()
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
         return list(executor.map(lambda case: _call_case(client, case, model), dataset))
