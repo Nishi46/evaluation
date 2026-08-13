@@ -5,11 +5,15 @@ on:
     paths:
       - "evalrun/**"
       - "datasets/**"
+      - "pyproject.toml"
+      - ".github/workflows/eval.yml"
   push:
     branches: [main]
     paths:
       - "evalrun/**"
       - "datasets/**"
+      - "pyproject.toml"
+      - ".github/workflows/eval.yml"
 
 jobs:
   eval-pr:

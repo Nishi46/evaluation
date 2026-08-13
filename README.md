@@ -14,11 +14,11 @@ Other use cases (tool-trajectory scoring, RAG retrieval scoring, safety datasets
 evaluation/
 ├── README.md                       # this file
 ├── pyproject.toml
-├── .env.example                    # HF_TOKEN
+├── .env.example                    # OLLAMA_HOST (optional; no API key needed)
 ├── evalrun/
 │   ├── __init__.py
 │   ├── dataset.py                  # load/validate YAML dataset
-│   ├── runner.py                   # calls HF Inference API against dataset
+│   ├── runner.py                   # calls local Ollama daemon against dataset
 │   ├── scorers.py                  # scorer registry + exact_match/regex/llm_judge
 │   ├── results.py                  # JSONL read/write, run-id/commit keying
 │   ├── cli.py                      # `evalrun` entrypoint
@@ -64,11 +64,11 @@ Seed dataset categories (18 cases total): arithmetic/exact-match (2), regex extr
 
 ## Runner (`evalrun/runner.py`)
 
-- `run(dataset, model="meta-llama/Llama-3.1-8B-Instruct", concurrency=5) -> list[RawResult]`.
-- One `chat_completion()` call per case via `huggingface_hub.InferenceClient()`; no tools/thinking (keep deterministic).
-- No retries: `huggingface_hub.InferenceClient` makes a single request per call with no built-in retry/backoff. A failed call (timeout, rate limit, provider error) is captured as `RawResult.error` rather than retried or raised — a hand-rolled retry loop is a known gap, not yet built.
-- Local disk cache in `.eval_cache/` keyed by `hash(model + input + params)`, skipped in CI unless explicitly enabled — avoids re-billing unchanged cases during local iteration.
-- Concurrency via `ThreadPoolExecutor` (SDK is sync; no asyncio needed at this scale).
+- `run(dataset, model="llama3.1", concurrency=5) -> list[RawResult]`.
+- One `chat()` call per case via `ollama.Client()`, talking to a local Ollama daemon (`http://localhost:11434` by default); no tools/thinking (keep deterministic). No API key required — this is why the model swapped from a hosted API to a local one.
+- No retries: the `ollama` client makes a single request per call with no built-in retry/backoff. A failed call (daemon not running, model not pulled, connection error) is captured as `RawResult.error` rather than retried or raised — a hand-rolled retry loop is a known gap, not yet built.
+- Local disk cache in `.eval_cache/` keyed by `hash(model + input + params)`, skipped in CI unless explicitly enabled — with Ollama there's no billing to avoid, but it still saves real time re-running unchanged cases locally.
+- Concurrency via `ThreadPoolExecutor` (client is sync; no asyncio needed at this scale). Ollama serves requests against one local model process, so concurrency mostly overlaps I/O rather than getting true parallel inference — it's still a net win since cache lookups and case setup aren't free.
 - Output: `RawResult(case_id, output_text, latency_ms, usage, error)`. Scoring is a separate pass — runner never scores.
 
 ## Scorers (`evalrun/scorers.py`)
@@ -93,11 +93,11 @@ SCORER_REGISTRY: dict[str, Callable[[Case, str], ScoreResult]] = {
 
 `llm_judge_scorer` is used for open-ended cases (summarization, instruction-following, reasoning, edge cases) where exact-match/regex can't capture quality.
 
-- **Judge model = runner model.** The judge is **the same model as the runner (`meta-llama/Llama-3.1-8B-Instruct` via Hugging Face Inference)**, imported directly as `JUDGE_MODEL = runner.DEFAULT_MODEL`. This keeps the framework to a single model dependency for Phase 1, at the cost of self-preference bias risk (not mitigated).
+- **Judge model = runner model.** The judge is **the same model as the runner (`llama3.1` via local Ollama)**, imported directly as `JUDGE_MODEL = runner.DEFAULT_MODEL`. This keeps the framework to a single model dependency for Phase 1, at the cost of self-preference bias risk (not mitigated).
 - **Rubric and threshold come from the dataset.** Each case supplies `rubric` (a 1-5 grading instruction) and an optional `pass_threshold` (default `4`) in its `scorer` config.
 - **Fixed grading prompt.** The judge is called with a single user message containing the original task (`case.input`), the model's response (`output`), and the `rubric`, asking it to score 1-5.
-- **Structured output.** The call passes `response_format` as a strict JSON schema (`{score: int, reasoning: str}`) via `chat_completion`, so the judge returns machine-parseable output rather than free text.
-- **Parsing fallback.** `_parse_judge_json` tries `json.loads` first; if that fails (not every HF Inference provider enforces the schema strictly), it regex-extracts the first `{...}` block from the response and parses that instead.
+- **Structured output.** The call passes `format` as a strict JSON schema (`{score: int, reasoning: str}`) to `ollama.Client().chat()`, which uses grammar-constrained decoding to guarantee the response matches — so the judge returns machine-parseable output rather than free text.
+- **Parsing fallback.** `_parse_judge_json` tries `json.loads` first; if that fails, it regex-extracts the first `{...}` block from the response and parses that instead. Ollama's structured output is enforced more reliably than a hosted API's `response_format` hint, so this fallback is mostly belt-and-suspenders at this point rather than a frequently-hit path.
 - **Scoring.** `passed = score >= pass_threshold`; the normalized `score` returned is `judge_score / 5.0`. The judge's `reasoning` string is preserved in `ScoreResult.detail` alongside the raw score and threshold, e.g. `judge_score=4/5 threshold=4 reasoning='...'`.
 - **Known limitations:** single judge call with no retry/majority-voting on parse failure, and the judge call's temperature isn't pinned (unlike the runner's `TEMPERATURE = 0`), so judge scores aren't fully deterministic run-to-run.
 
