@@ -3,11 +3,7 @@ import re
 from dataclasses import dataclass
 from typing import Callable
 
-from huggingface_hub import (
-    ChatCompletionInputJSONSchema,
-    ChatCompletionInputResponseFormatJSONSchema,
-    InferenceClient,
-)
+import ollama
 
 from evalrun.dataset import Case
 from evalrun.runner import DEFAULT_MODEL as JUDGE_MODEL
@@ -55,8 +51,8 @@ def _parse_judge_json(text: str) -> dict:
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        # not every HF Inference provider enforces the JSON schema strictly;
-        # fall back to pulling the first JSON object out of a prose response.
+        # belt-and-suspenders: fall back to pulling the first JSON object out
+        # of a prose response if structured output wasn't honored exactly.
         match = re.search(r"\{.*\}", text, re.DOTALL)
         if not match:
             raise ValueError(f"could not find JSON object in judge output: {text!r}")
@@ -67,18 +63,10 @@ def llm_judge_scorer(case: Case, output: str) -> ScoreResult:
     rubric = case.scorer_config["rubric"]
     pass_threshold = case.scorer_config.get("pass_threshold", 4)
 
-    client = InferenceClient()
-    response = client.chat_completion(
+    client = ollama.Client()
+    response = client.chat(
         model=JUDGE_MODEL,
-        max_tokens=1024,
-        response_format=ChatCompletionInputResponseFormatJSONSchema(
-            type="json_schema",
-            json_schema=ChatCompletionInputJSONSchema(
-                name="judge_score",
-                schema=JUDGE_JSON_SCHEMA,
-                strict=True,
-            ),
-        ),
+        format=JUDGE_JSON_SCHEMA,
         messages=[
             {
                 "role": "user",
@@ -93,7 +81,7 @@ def llm_judge_scorer(case: Case, output: str) -> ScoreResult:
         ],
     )
 
-    parsed = _parse_judge_json(response.choices[0].message.content)
+    parsed = _parse_judge_json(response.message.content)
     score = int(parsed["score"])
     reasoning = parsed["reasoning"]
     passed = score >= pass_threshold
