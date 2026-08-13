@@ -86,8 +86,20 @@ SCORER_REGISTRY: dict[str, Callable] = {
 
 - `exact_match_scorer`: normalized (whitespace/case) string compare against `expected_output`.
 - `regex_scorer`: `re.search(pattern, output)`.
-- `llm_judge_scorer`: judge model is **the same model as the runner (`meta-llama/Llama-3.1-8B-Instruct` via Hugging Face Inference)** — keeps the framework to a single model dependency for Phase 1. Uses structured output (`response_format` JSON schema via `chat_completion`: `{score: int, reasoning: str}`), with a fallback that extracts the first JSON object from the response if a given HF Inference provider doesn't strictly enforce the schema.
+- `llm_judge_scorer`: see below.
 - The registry is the extension point for future scorer types (tool-trajectory, retrieval-precision, safety-classifier) — new scorers register a function, no runner changes needed.
+
+### LLM-as-judge
+
+`llm_judge_scorer` is used for open-ended cases (summarization, instruction-following, reasoning, edge cases) where exact-match/regex can't capture quality.
+
+- **Judge model = runner model.** The judge is **the same model as the runner (`meta-llama/Llama-3.1-8B-Instruct` via Hugging Face Inference)**, imported directly as `JUDGE_MODEL = runner.DEFAULT_MODEL`. This keeps the framework to a single model dependency for Phase 1, at the cost of self-preference bias risk (not mitigated).
+- **Rubric and threshold come from the dataset.** Each case supplies `rubric` (a 1-5 grading instruction) and an optional `pass_threshold` (default `4`) in its `scorer` config.
+- **Fixed grading prompt.** The judge is called with a single user message containing the original task (`case.input`), the model's response (`output`), and the `rubric`, asking it to score 1-5.
+- **Structured output.** The call passes `response_format` as a strict JSON schema (`{score: int, reasoning: str}`) via `chat_completion`, so the judge returns machine-parseable output rather than free text.
+- **Parsing fallback.** `_parse_judge_json` tries `json.loads` first; if that fails (not every HF Inference provider enforces the schema strictly), it regex-extracts the first `{...}` block from the response and parses that instead.
+- **Scoring.** `passed = score >= pass_threshold`; the normalized `score` returned is `judge_score / 5.0`. The judge's `reasoning` string is preserved in `ScoreResult.detail` alongside the raw score and threshold, e.g. `judge_score=4/5 threshold=4 reasoning='...'`.
+- **Known limitations:** single judge call with no retry/majority-voting on parse failure, and the judge call's temperature isn't pinned (unlike the runner's `TEMPERATURE = 0`), so judge scores aren't fully deterministic run-to-run.
 
 ## Results (`evalrun/results.py`)
 
